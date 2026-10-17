@@ -1,26 +1,48 @@
-# Лаба 2 — TPC-H: бенчмарк на Apache Spark
+# Практическая №1 — Локальный Lakehouse, ELT и сжатие
+**Смирнов Владимир Алексеевич · VK Education · Вариант 1 (TPC-H Q3) · sf5**
 
-Прогон полного теста **TPC-H** (22 запроса) на **Spark 3.5.3** по данным в **Iceberg** (Lakekeeper + MinIO), с замером времени каждого запроса и пропускной способности. Это продолжение лабы 1 — там поднимается стек MinIO → Lakekeeper → Trino, на который мы здесь опираемся.
+## Краткое описание
+Реализация запроса TPC-H Q3 «Shipping Priority» на локальном стеке Lakehouse. Данные материализованы из генератора tpch.sf5 в Iceberg/MinIO через Trino. Выполнен анализ производительности сжатия ZSTD и построена медальонная архитектура (Bronze → Silver → Gold).
 
-## Что внутри
+## Стек технологий
+| Сервис | Роль | Почему выбран |
+| :--- | :--- | :--- |
+| MinIO (SILO) | S3-совместимое объектное хранилище | Open-source альтернатива AWS S3. Позволяет видеть физические объекты и их размеры через веб-консоль. Нативно поддерживает Iceberg. |
+| PostgreSQL | БД для метаданных Lakekeeper | Надежная ACID-СУБД для каталога. Обеспечивает стабильность при одновременных обращениях Trino и Spark. |
+| Lakekeeper | Iceberg REST Catalog | Управляет версиями таблиц и путями к файлам. Отделяет метаданные от данных, обеспечивая единую точку доступа для разных движков. Проще в развертывании, чем Polaris. |
+| Trino (v476) | SQL-движок для ETL | Идеален для CTAS-операций материализации TPC-H благодаря коннектору tpch. Версия 476 выбрана для совместимости с Iceberg Runtime. |
+| Metabase | BI-инструмент для Bronze/Gold | Легкий инструмент для визуализации. Подключается к Trino через Presto-драйвер. Позволяет проверять данные без SQL. |
 
-| Файл / папка | Что это |
-|---|---|
-| `гайд-3-бенчмарк.md` | основной гайд — вся лаба по шагам |
-| `tpch-spark/` | запуск теста на Spark: драйвер, 22 запроса, конфиги |
-| `tpch-spark/README.md` | подробная инструкция по запуску именно этой части |
+## Воспроизведение стенда
+Для поднятия стека использовались следующие команды Docker:
 
-## Быстрый старт
+```bash
+# MinIO (S3 Storage)
+docker run -d --name lakehouse-minio -p 9000:9000 -p 9001:9001 \
+  -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+  pgsty/silo:latest server /data --console-address ":9001"
 
-1. **Пререквизит** — поднят стек **MinIO → Lakekeeper → Trino** (из лабы 1) и есть каталоги `bench` и `tpch`.
-2. Дальше по шагам в [`tpch-spark/README.md`](tpch-spark/README.md):
-   - материализовать данные `sf5` из Trino в Iceberg (`materialize_sf5.sql`);
-   - скачать jar'ы Iceberg (два файла, ~90 МБ);
-   - прогнать 22 запроса в N потоков (`tpch_run.py`) и забрать `results.csv`.
+# PostgreSQL (Metadata DB)
+docker run -d --name lakehouse-pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:17
 
-## Что сдаёшь
+# Lakekeeper (Iceberg Catalog)
+docker run -d --name lakekeeper --network lakehouse-net \
+  -e LAKEKEEPER__PG_ENCRYPTION_KEY=This-is-NOT-Secure! \
+  -e LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@lakehouse-pg:5432/postgres \
+  -e LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://postgres:postgres@lakehouse-pg:5432/postgres \
+  -p 8181:8181 quay.io/lakekeeper/catalog:latest-main serve
 
-- `results.csv` и сводку из вывода драйвера (`Исполнений … ok … ошибок`, пропускная способность);
-- ответы на вопросы из `гайд-3-бенчмарк.md`.
+# Trino (SQL Engine)
+docker run -d --name trino -p 8080:8080 \
+  -v "${PWD}/catalog:/etc/trino/catalog" trinodb/trino:476
 
-> В git **не кладём** `jars/` (качаются командой из README), логи и `results*.csv` — они в `.gitignore`. Результаты генерируются при запуске.
+# Metabase (BI Tool)
+docker run -d --name metabase -p 3000:3000 \
+  -e "MB_DB_TYPE=postgres" \
+  -e "MB_DB_DBNAME=metabase" \
+  -e "MB_DB_PORT=5432" \
+  -e "MB_DB_USER=postgres" \
+  -e "MB_DB_PASS=postgres" \
+  -e "MB_DB_HOST=lakehouse-pg" \
+  --network lakehouse-net \
+  metabase/metabase:v0.50.8
